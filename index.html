@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU Profiler (SOA / Linear Floats)</title>
+    <title>WebGPU Profiler (SOA + Differential Timing)</title>
     <style>
         body { font-family: monospace; background-color: #121212; color: #ffaa00; padding: 15px; font-size: 13px; }
         button { padding: 15px 30px; font-size: 16px; font-weight: bold; background-color: #333; color: white; border: 2px solid #ffaa00; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
@@ -16,7 +16,7 @@
 </head>
 <body>
 
-    <h2>WebGPU SOA Profiler (Perfect Coalescing)</h2>
+    <h2>WebGPU SOA Profiler (Perfect Coalescing & Differential Timing)</h2>
     <button id="runBtn">Start Profiling (1MB to 500MB)</button>
     <div id="output">Ready...</div>
 
@@ -27,7 +27,7 @@ const runBtn = document.getElementById('runBtn');
 function log(msg) { outputDiv.innerHTML += msg + "\n"; }
 
 // Perfect SOA Shader
-// We use a flat array<f32>. The buffer is divided into 8 chunks.
+// Uses a flat array<f32>. The buffer is divided into 8 chunks.
 // Adjacent threads read adjacent floats, perfectly saturating the memory bus.
 const getWGSLSource = (wgX) => `
 @group(0) @binding(0) var<storage, read> bufferIn: array<f32>;
@@ -35,6 +35,7 @@ const getWGSLSource = (wgX) => `
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    // 2D grid index calculation to bypass 65k limit
     let i = global_id.x + global_id.y * (${wgX}u * 64u);
     let n = arrayLength(&bufferIn);
     
@@ -46,7 +47,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let add = 0.0001;
     
-    // Perfectly coalesced reads across the warp/wavefront
+    // Perfectly coalesced reads across the wavefront
     let v0 = bufferIn[i];
     let v1 = bufferIn[i + chunk];
     let v2 = bufferIn[i + chunk * 2u];
@@ -163,13 +164,31 @@ async function runProfiler() {
             return performance.now() - start;
         }
 
-        let passesTarget = Math.max(10, Math.floor(4000 / actualSizeMB)); 
-        passesTarget = Math.ceil(passesTarget / 2) * 2; 
-
-        await executePasses(6); // Governor Wakeup
-        const timeMs = await executePasses(passesTarget); 
+        // --- DIFFERENTIAL TIMING BLOCK ---
         
-        const passesPerSecond = (passesTarget / timeMs) * 1000;
+        // 1. Calculate dynamic pass targets
+        let passesLong = Math.max(20, Math.floor(4000 / actualSizeMB)); 
+        passesLong = Math.ceil(passesLong / 2) * 2; // Keep it even
+        let passesShort = Math.max(4, Math.floor(passesLong / 5)); 
+        passesShort = Math.ceil(passesShort / 2) * 2; // Keep it even
+
+        // 2. Governor Wakeup (Force GPU into high power state)
+        await executePasses(6); 
+        
+        // 3. Differential Measurement
+        const timeShort = await executePasses(passesShort); 
+        await new Promise(r => setTimeout(r, 20)); // Breathe to prevent thermal throttling
+        const timeLong = await executePasses(passesLong); 
+        
+        // 4. Subtract to eliminate CPU/Driver roundtrip overhead
+        const pureGPUTimeMs = timeLong - timeShort;
+        const purePasses = passesLong - passesShort;
+        
+        // Prevent division by zero if overhead subtraction results in 0 or negative (rare but possible on tiny sizes)
+        const safePureGPUTimeMs = Math.max(pureGPUTimeMs, 0.1);
+
+        const timePerPassMs = safePureGPUTimeMs / purePasses;
+        const passesPerSecond = 1000 / timePerPassMs;
         const bandwidthGBps = (passesPerSecond * bytesTransferredPerPass) / (1024 * 1024 * 1024);
 
         const barBlocks = Math.max(1, Math.floor(bandwidthGBps / 10)); 
