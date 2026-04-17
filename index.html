@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU Profiler (Texture Cache)</title>
+    <title>WebGPU Profiler (SOA / Linear Floats)</title>
     <style>
         body { font-family: monospace; background-color: #121212; color: #ffaa00; padding: 15px; font-size: 13px; }
         button { padding: 15px 30px; font-size: 16px; font-weight: bold; background-color: #333; color: white; border: 2px solid #ffaa00; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
@@ -16,7 +16,7 @@
 </head>
 <body>
 
-    <h2>WebGPU Texture Cache Profiler</h2>
+    <h2>WebGPU SOA Profiler (Perfect Coalescing)</h2>
     <button id="runBtn">Start Profiling (1MB to 500MB)</button>
     <div id="output">Ready...</div>
 
@@ -26,24 +26,45 @@ const runBtn = document.getElementById('runBtn');
 
 function log(msg) { outputDiv.innerHTML += msg + "\n"; }
 
-// WGSL using Textures instead of Buffers to hit the L1/L2 texture caches
-const wgslSource = `
-@group(0) @binding(0) var texIn: texture_2d<f32>;
-@group(0) @binding(1) var texOut: texture_storage_2d<rgba32float, write>;
+// Perfect SOA Shader
+// We use a flat array<f32>. The buffer is divided into 8 chunks.
+// Adjacent threads read adjacent floats, perfectly saturating the memory bus.
+const getWGSLSource = (wgX) => `
+@group(0) @binding(0) var<storage, read> bufferIn: array<f32>;
+@group(0) @binding(1) var<storage, read_write> bufferOut: array<f32>;
 
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let dim = textureDimensions(texIn);
-    let coord = vec2<i32>(id.xy);
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let i = global_id.x + global_id.y * (${wgX}u * 64u);
+    let n = arrayLength(&bufferIn);
     
-    // Bounds check
-    if (coord.x >= i32(dim.x) || coord.y >= i32(dim.y)) {
-        return;
-    }
+    // Divide the array into 8 sequential chunks
+    let chunk = n / 8u;
+    
+    // Ensure we don't read out of bounds
+    if (i >= chunk) { return; }
 
-    // Read from texture cache, write to texture cache
-    let val = textureLoad(texIn, coord, 0);
-    textureStore(texOut, coord, val + vec4<f32>(0.0001));
+    let add = 0.0001;
+    
+    // Perfectly coalesced reads across the warp/wavefront
+    let v0 = bufferIn[i];
+    let v1 = bufferIn[i + chunk];
+    let v2 = bufferIn[i + chunk * 2u];
+    let v3 = bufferIn[i + chunk * 3u];
+    let v4 = bufferIn[i + chunk * 4u];
+    let v5 = bufferIn[i + chunk * 5u];
+    let v6 = bufferIn[i + chunk * 6u];
+    let v7 = bufferIn[i + chunk * 7u];
+
+    // Perfectly coalesced writes
+    bufferOut[i] = v0 + add;
+    bufferOut[i + chunk] = v1 + add;
+    bufferOut[i + chunk * 2u] = v2 + add;
+    bufferOut[i + chunk * 3u] = v3 + add;
+    bufferOut[i + chunk * 4u] = v4 + add;
+    bufferOut[i + chunk * 5u] = v5 + add;
+    bufferOut[i + chunk * 6u] = v6 + add;
+    bufferOut[i + chunk * 7u] = v7 + add;
 }
 `;
 
@@ -54,11 +75,13 @@ async function runProfiler() {
     }
 
     runBtn.disabled = true;
-    outputDiv.innerHTML = "Initializing WebGPU Texture Pipeline...\n\n";
+    outputDiv.innerHTML = "Initializing WebGPU SOA Pipeline...\n\n";
 
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     const requiredLimits = {
-        maxTextureDimension2D: adapter.limits.maxTextureDimension2D
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: adapter.limits.maxBufferSize, 
+        maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
     };
     
     const device = await adapter.requestDevice({ requiredLimits });
@@ -67,67 +90,54 @@ async function runProfiler() {
         log(`<span class='error-msg'>🚨 Error: ${event.error.message}</span>`);
     });
 
-    const maxTexSize = device.limits.maxTextureDimension2D;
-    // Calculate theoretical max MB based on max 2D texture dimensions (16 bytes per pixel)
-    const absoluteMaxMB = Math.floor((maxTexSize * maxTexSize * 16) / (1024 * 1024));
+    const maxAllocMB = Math.floor(device.limits.maxBufferSize / (1024 * 1024));
+    const maxBindMB = Math.floor(device.limits.maxStorageBufferBindingSize / (1024 * 1024));
+    const maxSafeMB = Math.min(maxAllocMB, maxBindMB);
 
     log(`ℹ️ Adapter: ${adapter.info ? adapter.info.architecture : 'Unknown GPU'}`);
-    log(`ℹ️ Max Texture Dim: ${maxTexSize}px (~${absoluteMaxMB} MB limit)`);
+    log(`ℹ️ Safe Allocation Limit: ${maxSafeMB} MB`);
     log("Size (MB) | Speed (GB/s) | Graph");
     log("--------------------------------------------------");
 
     let currentSizeMB = 1.0;
-    const targetMaxSizeMB = 500.0;
+    let targetMaxSizeMB = 500.0;
     const growthFactor = 1.15;
-    const finalLimitMB = Math.min(targetMaxSizeMB, absoluteMaxMB);
+    const absoluteMaxMB = Math.min(targetMaxSizeMB, maxSafeMB);
 
-    const shaderModule = device.createShaderModule({ code: wgslSource });
-    const pipeline = device.createComputePipeline({
-        layout: 'auto',
-        compute: { module: shaderModule, entryPoint: "main" }
-    });
-
-    while (currentSizeMB <= finalLimitMB) {
-        // 16 bytes per pixel for rgba32float
-        const targetPixels = (currentSizeMB * 1024 * 1024) / 16;
-        const width = Math.floor(Math.sqrt(targetPixels));
-        const height = Math.floor(targetPixels / width);
+    while (currentSizeMB <= absoluteMaxMB) {
+        const sizeBytes = Math.floor(currentSizeMB * 1024 * 1024);
         
-        const actualSizeMB = (width * height * 16) / (1024 * 1024);
-        const bytesTransferredPerPass = (width * height * 16) * 2; // Read + Write
+        // Ensure memory is a clean multiple for 8-chunk division
+        const alignedSizeBytes = Math.ceil(sizeBytes / 256) * 256;
+        const actualSizeMB = alignedSizeBytes / (1024 * 1024);
+        const bytesTransferredPerPass = alignedSizeBytes * 2; 
 
-        // Create Textures instead of Buffers
-        const texA = device.createTexture({
-            size: [width, height, 1],
-            format: 'rgba32float',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
-        });
-        const texB = device.createTexture({
-            size: [width, height, 1],
-            format: 'rgba32float',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+        const bufferA = device.createBuffer({ size: alignedSizeBytes, usage: GPUBufferUsage.STORAGE });
+        const bufferB = device.createBuffer({ size: alignedSizeBytes, usage: GPUBufferUsage.STORAGE });
+
+        // Calculate geometry: 1 float is 4 bytes. We process 8 floats per thread.
+        const elementsCount = alignedSizeBytes / 4; 
+        const threadsNeeded = Math.ceil((elementsCount / 8)); 
+        const totalWorkgroups = Math.ceil(threadsNeeded / 64);
+        
+        const limitX = 65000; 
+        const wgX = Math.min(totalWorkgroups, limitX);
+        const wgY = Math.ceil(totalWorkgroups / wgX);
+
+        const shaderModule = device.createShaderModule({ code: getWGSLSource(wgX) });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: shaderModule, entryPoint: "main" }
         });
 
-        // Bind Read(A) -> Write(B)
         const bindGroupAB = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: texA.createView() },
-                { binding: 1, resource: texB.createView() }
-            ]
+            entries: [{ binding: 0, resource: { buffer: bufferA } }, { binding: 1, resource: { buffer: bufferB } }]
         });
-
-        // Bind Read(B) -> Write(A)
         const bindGroupBA = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: texB.createView() },
-                { binding: 1, resource: texA.createView() }
-            ]
+            entries: [{ binding: 0, resource: { buffer: bufferB } }, { binding: 1, resource: { buffer: bufferA } }]
         });
-
-        const wgX = Math.ceil(width / 8);
-        const wgY = Math.ceil(height / 8);
 
         async function executePasses(numPasses) {
             const safePasses = Math.max(2, Math.floor(numPasses / 2) * 2);
@@ -156,9 +166,7 @@ async function runProfiler() {
         let passesTarget = Math.max(10, Math.floor(4000 / actualSizeMB)); 
         passesTarget = Math.ceil(passesTarget / 2) * 2; 
 
-        // Warmup 
-        await executePasses(4); 
-        
+        await executePasses(6); // Governor Wakeup
         const timeMs = await executePasses(passesTarget); 
         
         const passesPerSecond = (passesTarget / timeMs) * 1000;
@@ -172,15 +180,15 @@ async function runProfiler() {
         
         log(`${sizeStr} MB | ${bwStr} GB/s | <span class="graph-bar">${barString}</span>`);
 
-        texA.destroy();
-        texB.destroy();
+        bufferA.destroy();
+        bufferB.destroy();
 
         currentSizeMB *= growthFactor;
         await new Promise(r => setTimeout(r, 50)); 
     }
 
     log("--------------------------------------------------");
-    log("✅ Profiling Complete!");
+    log("✅ SOA Profiling Complete!");
     runBtn.disabled = false;
 }
 
