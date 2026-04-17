@@ -3,31 +3,15 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU Cache Boundary Profiler</title>
+    <title>WebGPU Profiler (Fixed)</title>
     <style>
-        body {
-            font-family: monospace;
-            background-color: #121212;
-            color: #ffaa00;
-            padding: 15px;
-            font-size: 13px;
-        }
-        button {
-            padding: 15px 30px;
-            font-size: 16px;
-            font-weight: bold;
-            background-color: #333;
-            color: white;
-            border: 2px solid #ffaa00;
-            border-radius: 8px;
-            cursor: pointer;
-            margin-bottom: 20px;
-        }
+        body { font-family: monospace; background-color: #121212; color: #ffaa00; padding: 15px; font-size: 13px; }
+        button { padding: 15px 30px; font-size: 16px; font-weight: bold; background-color: #333; color: white; border: 2px solid #ffaa00; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
         button:active { background-color: #ffaa00; color: black; }
         button:disabled { border-color: #555; color: #555; cursor: not-allowed; }
         #output { white-space: pre-wrap; line-height: 1.4; }
         .graph-bar { color: #00ff00; }
-        .limit-warning { color: #ff5555; }
+        .error-msg { color: #ff5555; }
     </style>
 </head>
 <body>
@@ -42,27 +26,42 @@ const runBtn = document.getElementById('runBtn');
 
 function log(msg) { outputDiv.innerHTML += msg + "\n"; }
 
-window.onerror = function(message) {
-    log("<span class='limit-warning'>🚨 ERROR: " + message + "</span>"); return true;
-};
-
-// WGSL Compute Shader
-// Reads from binding 0, writes to binding 1. We use vec4<f32> (16 bytes) to maximize memory throughput.
-const wgslSource = `
+// Unrolled shader to aggressively saturate the memory controller
+// We read 4 vec4s (64 bytes) and write 4 vec4s per thread.
+const getWGSLSource = (wgX) => `
 @group(0) @binding(0) var<storage, read> bufferIn: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> bufferOut: array<vec4<f32>>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let i = global_id.x;
-    // Simple math operation to prevent the compiler from optimizing out the read/write
-    bufferOut[i] = bufferIn[i] + vec4<f32>(0.0001);
+    // 2D to 1D index mapping to bypass the 65,535 workgroup limit
+    let base_thread_idx = global_id.x + global_id.y * (${wgX}u * 64u);
+    
+    // Multiply by 4 because we are processing 4 elements per thread
+    let i = base_thread_idx * 4u;
+    
+    // Safety bounds check
+    if (i + 3u >= arrayLength(&bufferIn)) { return; }
+
+    // Aggressive unrolled reads
+    let v0 = bufferIn[i];
+    let v1 = bufferIn[i + 1u];
+    let v2 = bufferIn[i + 2u];
+    let v3 = bufferIn[i + 3u];
+
+    let add = vec4<f32>(0.0001);
+    
+    // Aggressive unrolled writes
+    bufferOut[i] = v0 + add;
+    bufferOut[i + 1u] = v1 + add;
+    bufferOut[i + 2u] = v2 + add;
+    bufferOut[i + 3u] = v3 + add;
 }
 `;
 
 async function runProfiler() {
     if (!navigator.gpu) {
-        log("<span class='limit-warning'>❌ WebGPU is not supported in this browser.</span>"); 
+        log("<span class='error-msg'>❌ WebGPU is not supported.</span>"); 
         return;
     }
 
@@ -70,124 +69,98 @@ async function runProfiler() {
     outputDiv.innerHTML = "Initializing WebGPU...\n\n";
 
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) {
-        log("<span class='limit-warning'>❌ Failed to get WebGPU adapter.</span>");
-        return;
-    }
-
-    // Request maximum buffer limits from the device (browsers often default to 128MB or 256MB)
     const requiredLimits = {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
     };
-    
     const device = await adapter.requestDevice({ requiredLimits });
+
+    // Catch WebGPU validation errors so they don't fail silently anymore
+    device.addEventListener('uncapturederror', (event) => {
+        log(`<span class='error-msg'>🚨 WebGPU Error: ${event.error.message}</span>`);
+    });
+
     const maxBufferSizeMB = Math.floor(device.limits.maxStorageBufferBindingSize / (1024 * 1024));
 
     log(`ℹ️ Adapter: ${adapter.info ? adapter.info.architecture : 'Unknown GPU'}`);
-    log(`ℹ️ Max Storage Buffer Limit: ${maxBufferSizeMB} MB`);
+    log(`ℹ️ Max Buffer Limit: ${maxBufferSizeMB} MB`);
     log("Size (MB) | Speed (GB/s) | Graph");
     log("--------------------------------------------------");
-
-    const shaderModule = device.createShaderModule({ code: wgslSource });
-    const pipeline = device.createComputePipeline({
-        layout: 'auto',
-        compute: { module: shaderModule, entryPoint: "main" }
-    });
 
     let currentSizeMB = 1.0;
     let targetMaxSizeMB = 500.0;
     const growthFactor = 1.15;
-
-    // Cap at the browser's maximum buffer limit
     const absoluteMaxMB = Math.min(targetMaxSizeMB, maxBufferSizeMB);
 
     while (currentSizeMB <= absoluteMaxMB) {
         const sizeBytes = Math.floor(currentSizeMB * 1024 * 1024);
         
-        // Ensure byte size is a multiple of 16 (for vec4<f32>) and 256 (for alignment requirements)
+        // Ensure alignment 
         const alignedSizeBytes = Math.ceil(sizeBytes / 256) * 256;
         const actualSizeMB = alignedSizeBytes / (1024 * 1024);
+        const bytesTransferredPerPass = alignedSizeBytes * 2; // 1 Read + 1 Write
+
+        const bufferA = device.createBuffer({ size: alignedSizeBytes, usage: GPUBufferUsage.STORAGE });
+        const bufferB = device.createBuffer({ size: alignedSizeBytes, usage: GPUBufferUsage.STORAGE });
+
+        // Calculate dispatch geometry
+        const elementsCount = alignedSizeBytes / 16; 
+        const threadsNeeded = Math.ceil(elementsCount / 4); // 4 elements per thread
+        const totalWorkgroups = Math.ceil(threadsNeeded / 64);
         
-        // Each pass does 1 full Read + 1 full Write
-        const bytesTransferredPerPass = alignedSizeBytes * 2; 
+        // Split into 2D to respect the 65,535 limit
+        const limitX = 65000; 
+        const wgX = Math.min(totalWorkgroups, limitX);
+        const wgY = Math.ceil(totalWorkgroups / wgX);
 
-        // Create Buffers
-        const bufferA = device.createBuffer({
-            size: alignedSizeBytes,
-            usage: GPUBufferUsage.STORAGE,
-        });
-        const bufferB = device.createBuffer({
-            size: alignedSizeBytes,
-            usage: GPUBufferUsage.STORAGE,
+        // Compile pipeline with custom X dimension
+        const shaderModule = device.createShaderModule({ code: getWGSLSource(wgX) });
+        const pipeline = device.createComputePipeline({
+            layout: 'auto',
+            compute: { module: shaderModule, entryPoint: "main" }
         });
 
-        // Create Bindings for A->B
         const bindGroupAB = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: bufferA } },
-                { binding: 1, resource: { buffer: bufferB } }
-            ]
+            entries: [{ binding: 0, resource: { buffer: bufferA } }, { binding: 1, resource: { buffer: bufferB } }]
         });
-
-        // Create Bindings for B->A
         const bindGroupBA = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: { buffer: bufferB } },
-                { binding: 1, resource: { buffer: bufferA } }
-            ]
+            entries: [{ binding: 0, resource: { buffer: bufferB } }, { binding: 1, resource: { buffer: bufferA } }]
         });
-
-        const elementsCount = alignedSizeBytes / 16; // 16 bytes per vec4
-        const workgroupCount = Math.ceil(elementsCount / 64);
 
         async function executePasses(numPasses) {
             const safePasses = Math.max(2, Math.floor(numPasses / 2) * 2);
-            
             const start = performance.now();
             const commandEncoder = device.createCommandEncoder();
 
             for (let i = 0; i < safePasses; i += 2) {
-                // Pass 1: A -> B
-                const passEncoder1 = commandEncoder.beginComputePass();
-                passEncoder1.setPipeline(pipeline);
-                passEncoder1.setBindGroup(0, bindGroupAB);
-                passEncoder1.dispatchWorkgroups(workgroupCount);
-                passEncoder1.end();
+                const pass1 = commandEncoder.beginComputePass();
+                pass1.setPipeline(pipeline);
+                pass1.setBindGroup(0, bindGroupAB);
+                pass1.dispatchWorkgroups(wgX, wgY);
+                pass1.end();
 
-                // Pass 2: B -> A
-                const passEncoder2 = commandEncoder.beginComputePass();
-                passEncoder2.setPipeline(pipeline);
-                passEncoder2.setBindGroup(0, bindGroupBA);
-                passEncoder2.dispatchWorkgroups(workgroupCount);
-                passEncoder2.end();
+                const pass2 = commandEncoder.beginComputePass();
+                pass2.setPipeline(pipeline);
+                pass2.setBindGroup(0, bindGroupBA);
+                pass2.dispatchWorkgroups(wgX, wgY);
+                pass2.end();
             }
 
             device.queue.submit([commandEncoder.finish()]);
-            
-            // Wait for GPU to physically finish execution
             await device.queue.onSubmittedWorkDone(); 
             return performance.now() - start;
         }
 
-        // Calculate dynamic pass count based on buffer size to keep test brief but accurate
-        let rawPasses = Math.max(20, Math.floor(10000 / actualSizeMB)); 
-        let passesTarget = Math.ceil(rawPasses / 2) * 2; 
-        let shortPass = Math.max(10, Math.ceil((passesTarget / 10) / 2) * 2);
+        // Scale passes so the test runs for at least ~40ms to avoid micro-stutter anomalies
+        let passesTarget = Math.max(10, Math.floor(4000 / actualSizeMB)); 
+        passesTarget = Math.ceil(passesTarget / 2) * 2; 
 
-        await executePasses(4); // GPU Warmup
-        const timeShort = await executePasses(shortPass); // Measure baseline JS/API overhead
-        await new Promise(r => setTimeout(r, 20)); // Let the device breathe
-        const timeLong = await executePasses(passesTarget); // Measure full load
-
-        // Calculate true GPU time by subtracting overhead
-        const pureGPUTimeMs = timeLong - timeShort;
-        const diffPasses = passesTarget - shortPass;
+        await executePasses(2); // Warmup
+        const timeMs = await executePasses(passesTarget); // Actual measurement
         
-        const timePerPassMs = pureGPUTimeMs / diffPasses;
-        const passesPerSecond = 1000 / timePerPassMs;
+        const passesPerSecond = (passesTarget / timeMs) * 1000;
         const bandwidthGBps = (passesPerSecond * bytesTransferredPerPass) / (1024 * 1024 * 1024);
 
         const barBlocks = Math.max(1, Math.floor(bandwidthGBps / 10)); 
@@ -198,16 +171,11 @@ async function runProfiler() {
         
         log(`${sizeStr} MB | ${bwStr} GB/s | <span class="graph-bar">${barString}</span>`);
 
-        // Clean up memory to avoid crashing the tab
         bufferA.destroy();
         bufferB.destroy();
 
         currentSizeMB *= growthFactor;
         await new Promise(r => setTimeout(r, 50)); 
-    }
-
-    if (currentSizeMB > absoluteMaxMB && absoluteMaxMB < targetMaxSizeMB) {
-        log(`\n<span class='limit-warning'>⚠️ Stopped at ${absoluteMaxMB} MB due to browser WebGPU limits.</span>`);
     }
 
     log("--------------------------------------------------");
