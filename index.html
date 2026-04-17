@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU Profiler (Fixed)</title>
+    <title>WebGPU Profiler (RDNA-3 Optimized)</title>
     <style>
         body { font-family: monospace; background-color: #121212; color: #ffaa00; padding: 15px; font-size: 13px; }
         button { padding: 15px 30px; font-size: 16px; font-weight: bold; background-color: #333; color: white; border: 2px solid #ffaa00; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
@@ -26,36 +26,39 @@ const runBtn = document.getElementById('runBtn');
 
 function log(msg) { outputDiv.innerHTML += msg + "\n"; }
 
-// Unrolled shader to aggressively saturate the memory controller
-// We read 4 vec4s (64 bytes) and write 4 vec4s per thread.
+// Aggressive 8x unrolling to saturate deep RDNA-3 memory pipelines
 const getWGSLSource = (wgX) => `
 @group(0) @binding(0) var<storage, read> bufferIn: array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read_write> bufferOut: array<vec4<f32>>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    // 2D to 1D index mapping to bypass the 65,535 workgroup limit
-    let base_thread_idx = global_id.x + global_id.y * (${wgX}u * 64u);
+    // 8 elements per thread
+    let base_idx = (global_id.x + global_id.y * (${wgX}u * 64u)) * 8u;
     
-    // Multiply by 4 because we are processing 4 elements per thread
-    let i = base_thread_idx * 4u;
-    
-    // Safety bounds check
-    if (i + 3u >= arrayLength(&bufferIn)) { return; }
-
-    // Aggressive unrolled reads
-    let v0 = bufferIn[i];
-    let v1 = bufferIn[i + 1u];
-    let v2 = bufferIn[i + 2u];
-    let v3 = bufferIn[i + 3u];
+    if (base_idx + 7u >= arrayLength(&bufferIn)) { return; }
 
     let add = vec4<f32>(0.0001);
     
-    // Aggressive unrolled writes
-    bufferOut[i] = v0 + add;
-    bufferOut[i + 1u] = v1 + add;
-    bufferOut[i + 2u] = v2 + add;
-    bufferOut[i + 3u] = v3 + add;
+    // Read phase - Flood the memory controller with requests
+    let v0 = bufferIn[base_idx];
+    let v1 = bufferIn[base_idx + 1u];
+    let v2 = bufferIn[base_idx + 2u];
+    let v3 = bufferIn[base_idx + 3u];
+    let v4 = bufferIn[base_idx + 4u];
+    let v5 = bufferIn[base_idx + 5u];
+    let v6 = bufferIn[base_idx + 6u];
+    let v7 = bufferIn[base_idx + 7u];
+
+    // Write phase
+    bufferOut[base_idx] = v0 + add;
+    bufferOut[base_idx + 1u] = v1 + add;
+    bufferOut[base_idx + 2u] = v2 + add;
+    bufferOut[base_idx + 3u] = v3 + add;
+    bufferOut[base_idx + 4u] = v4 + add;
+    bufferOut[base_idx + 5u] = v5 + add;
+    bufferOut[base_idx + 6u] = v6 + add;
+    bufferOut[base_idx + 7u] = v7 + add;
 }
 `;
 
@@ -69,51 +72,54 @@ async function runProfiler() {
     outputDiv.innerHTML = "Initializing WebGPU...\n\n";
 
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    
+    // Explicitly ask for ALL the memory the adapter allows
     const requiredLimits = {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: adapter.limits.maxBufferSize, // <-- The missing key from the error message
         maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension
     };
+    
     const device = await adapter.requestDevice({ requiredLimits });
 
-    // Catch WebGPU validation errors so they don't fail silently anymore
     device.addEventListener('uncapturederror', (event) => {
-        log(`<span class='error-msg'>🚨 WebGPU Error: ${event.error.message}</span>`);
+        log(`<span class='error-msg'>🚨 Error: ${event.error.message}</span>`);
     });
 
-    const maxBufferSizeMB = Math.floor(device.limits.maxStorageBufferBindingSize / (1024 * 1024));
+    // Our max size is bound by whichever limit is lower
+    const maxAllocMB = Math.floor(device.limits.maxBufferSize / (1024 * 1024));
+    const maxBindMB = Math.floor(device.limits.maxStorageBufferBindingSize / (1024 * 1024));
+    const maxSafeMB = Math.min(maxAllocMB, maxBindMB);
 
     log(`ℹ️ Adapter: ${adapter.info ? adapter.info.architecture : 'Unknown GPU'}`);
-    log(`ℹ️ Max Buffer Limit: ${maxBufferSizeMB} MB`);
+    log(`ℹ️ Safe Allocation Limit: ${maxSafeMB} MB`);
     log("Size (MB) | Speed (GB/s) | Graph");
     log("--------------------------------------------------");
 
     let currentSizeMB = 1.0;
     let targetMaxSizeMB = 500.0;
     const growthFactor = 1.15;
-    const absoluteMaxMB = Math.min(targetMaxSizeMB, maxBufferSizeMB);
+    const absoluteMaxMB = Math.min(targetMaxSizeMB, maxSafeMB);
 
     while (currentSizeMB <= absoluteMaxMB) {
         const sizeBytes = Math.floor(currentSizeMB * 1024 * 1024);
         
-        // Ensure alignment 
         const alignedSizeBytes = Math.ceil(sizeBytes / 256) * 256;
         const actualSizeMB = alignedSizeBytes / (1024 * 1024);
-        const bytesTransferredPerPass = alignedSizeBytes * 2; // 1 Read + 1 Write
+        const bytesTransferredPerPass = alignedSizeBytes * 2; 
 
         const bufferA = device.createBuffer({ size: alignedSizeBytes, usage: GPUBufferUsage.STORAGE });
         const bufferB = device.createBuffer({ size: alignedSizeBytes, usage: GPUBufferUsage.STORAGE });
 
-        // Calculate dispatch geometry
+        // Calculate dispatch geometry based on 8 elements per thread
         const elementsCount = alignedSizeBytes / 16; 
-        const threadsNeeded = Math.ceil(elementsCount / 4); // 4 elements per thread
+        const threadsNeeded = Math.ceil(elementsCount / 8); 
         const totalWorkgroups = Math.ceil(threadsNeeded / 64);
         
-        // Split into 2D to respect the 65,535 limit
         const limitX = 65000; 
         const wgX = Math.min(totalWorkgroups, limitX);
         const wgY = Math.ceil(totalWorkgroups / wgX);
 
-        // Compile pipeline with custom X dimension
         const shaderModule = device.createShaderModule({ code: getWGSLSource(wgX) });
         const pipeline = device.createComputePipeline({
             layout: 'auto',
@@ -153,12 +159,13 @@ async function runProfiler() {
             return performance.now() - start;
         }
 
-        // Scale passes so the test runs for at least ~40ms to avoid micro-stutter anomalies
         let passesTarget = Math.max(10, Math.floor(4000 / actualSizeMB)); 
         passesTarget = Math.ceil(passesTarget / 2) * 2; 
 
-        await executePasses(2); // Warmup
-        const timeMs = await executePasses(passesTarget); // Actual measurement
+        // Extended Warmup to force Android GPU Governor into high-power state
+        await executePasses(6); 
+        
+        const timeMs = await executePasses(passesTarget); 
         
         const passesPerSecond = (passesTarget / timeMs) * 1000;
         const bandwidthGBps = (passesPerSecond * bytesTransferredPerPass) / (1024 * 1024 * 1024);
