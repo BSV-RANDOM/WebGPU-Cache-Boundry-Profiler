@@ -1,9 +1,9 @@
-  <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WebGPU Profiler (Texture Caches & Diff Timing)</title>
+    <title>WebGPU Profiler (Graphics Pipeline)</title>
     <style>
         body { font-family: monospace; background-color: #121212; color: #ffaa00; padding: 15px; font-size: 13px; }
         button { padding: 15px 30px; font-size: 16px; font-weight: bold; background-color: #333; color: white; border: 2px solid #ffaa00; border-radius: 8px; cursor: pointer; margin-bottom: 20px; }
@@ -16,7 +16,7 @@
 </head>
 <body>
 
-    <h2>WebGPU Texture Cache Profiler</h2>
+    <h2>WebGPU Graphics Pipeline Profiler (ROPs & DCC)</h2>
     <button id="runBtn">Start Profiling (1MB to 500MB)</button>
     <div id="output">Ready...</div>
 
@@ -26,21 +26,25 @@ const runBtn = document.getElementById('runBtn');
 
 function log(msg) { outputDiv.innerHTML += msg + "\n"; }
 
-// WGSL using Textures to hit the high-speed L1/L2 texture caches
+// Vertex shader generates a massive full-screen triangle to cover the texture
+// Fragment shader reads exactly one pixel and writes it back + 0.0001
 const wgslSource = `
+@vertex
+fn vs_main(@builtin(vertex_index) VertexIndex : u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0)
+    );
+    return vec4<f32>(pos[VertexIndex], 0.0, 1.0);
+}
+
 @group(0) @binding(0) var texIn: texture_2d<f32>;
-@group(0) @binding(1) var texOut: texture_storage_2d<rgba32float, write>;
 
-@compute @workgroup_size(8, 8)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let dim = textureDimensions(texIn);
-    let coord = vec2<i32>(id.xy);
-    
-    if (coord.x >= i32(dim.x) || coord.y >= i32(dim.y)) { return; }
-
-    // Read from texture cache, write to texture cache
-    let val = textureLoad(texIn, coord, 0);
-    textureStore(texOut, coord, val + vec4<f32>(0.0001));
+@fragment
+fn fs_main(@builtin(position) coord: vec4<f32>) -> @location(0) vec4<f32> {
+    let val = textureLoad(texIn, vec2<i32>(coord.xy), 0);
+    return val + vec4<f32>(0.0001);
 }
 `;
 
@@ -51,11 +55,14 @@ async function runProfiler() {
     }
 
     runBtn.disabled = true;
-    outputDiv.innerHTML = "Initializing WebGPU Texture Pipeline...\n\n";
+    outputDiv.innerHTML = "Initializing WebGPU Graphics Pipeline...\n\n";
 
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    
+    // Explicitly ask for maxBufferSize to prevent Dawn's staging buffer crash
     const requiredLimits = {
-        maxTextureDimension2D: adapter.limits.maxTextureDimension2D
+        maxTextureDimension2D: adapter.limits.maxTextureDimension2D,
+        maxBufferSize: adapter.limits.maxBufferSize
     };
     
     const device = await adapter.requestDevice({ requiredLimits });
@@ -78,13 +85,20 @@ async function runProfiler() {
     const finalLimitMB = Math.min(targetMaxSizeMB, absoluteMaxMB);
 
     const shaderModule = device.createShaderModule({ code: wgslSource });
-    const pipeline = device.createComputePipeline({
+    
+    // Create a RENDER pipeline instead of COMPUTE
+    const pipeline = device.createRenderPipeline({
         layout: 'auto',
-        compute: { module: shaderModule, entryPoint: "main" }
+        vertex: { module: shaderModule, entryPoint: 'vs_main' },
+        fragment: {
+            module: shaderModule,
+            entryPoint: 'fs_main',
+            targets: [{ format: 'rgba32float' }] // Write target format
+        },
+        primitive: { topology: 'triangle-list' }
     });
 
     while (currentSizeMB <= finalLimitMB) {
-        // 16 bytes per pixel for rgba32float
         const targetPixels = (currentSizeMB * 1024 * 1024) / 16;
         const width = Math.floor(Math.sqrt(targetPixels));
         const height = Math.floor(targetPixels / width);
@@ -92,35 +106,29 @@ async function runProfiler() {
         const actualSizeMB = (width * height * 16) / (1024 * 1024);
         const bytesTransferredPerPass = (width * height * 16) * 2; 
 
+        // Usage includes RENDER_ATTACHMENT so it acts like a WebGL Framebuffer
         const texA = device.createTexture({
             size: [width, height, 1],
             format: 'rgba32float',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
         });
         const texB = device.createTexture({
             size: [width, height, 1],
             format: 'rgba32float',
-            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+            usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
         });
 
-        const bindGroupAB = device.createBindGroup({
+        const viewA = texA.createView();
+        const viewB = texB.createView();
+
+        const bindGroupReadA = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: texA.createView() },
-                { binding: 1, resource: texB.createView() }
-            ]
+            entries: [{ binding: 0, resource: viewA }]
         });
-
-        const bindGroupBA = device.createBindGroup({
+        const bindGroupReadB = device.createBindGroup({
             layout: pipeline.getBindGroupLayout(0),
-            entries: [
-                { binding: 0, resource: texB.createView() },
-                { binding: 1, resource: texA.createView() }
-            ]
+            entries: [{ binding: 0, resource: viewB }]
         });
-
-        const wgX = Math.ceil(width / 8);
-        const wgY = Math.ceil(height / 8);
 
         async function executePasses(numPasses) {
             const safePasses = Math.max(2, Math.floor(numPasses / 2) * 2);
@@ -128,16 +136,30 @@ async function runProfiler() {
             const commandEncoder = device.createCommandEncoder();
 
             for (let i = 0; i < safePasses; i += 2) {
-                const pass1 = commandEncoder.beginComputePass();
+                // Pass 1: Read A, Write to B
+                const pass1 = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: viewB,
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                        loadOp: 'clear', storeOp: 'store'
+                    }]
+                });
                 pass1.setPipeline(pipeline);
-                pass1.setBindGroup(0, bindGroupAB);
-                pass1.dispatchWorkgroups(wgX, wgY);
+                pass1.setBindGroup(0, bindGroupReadA);
+                pass1.draw(3); // Draw full screen triangle
                 pass1.end();
 
-                const pass2 = commandEncoder.beginComputePass();
+                // Pass 2: Read B, Write to A
+                const pass2 = commandEncoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: viewA,
+                        clearValue: { r: 0, g: 0, b: 0, a: 0 },
+                        loadOp: 'clear', storeOp: 'store'
+                    }]
+                });
                 pass2.setPipeline(pipeline);
-                pass2.setBindGroup(0, bindGroupBA);
-                pass2.dispatchWorkgroups(wgX, wgY);
+                pass2.setBindGroup(0, bindGroupReadB);
+                pass2.draw(3);
                 pass2.end();
             }
 
@@ -146,7 +168,7 @@ async function runProfiler() {
             return performance.now() - start;
         }
 
-        // --- DIFFERENTIAL TIMING ---
+        // Differential Timing
         let passesLong = Math.max(20, Math.floor(4000 / actualSizeMB)); 
         passesLong = Math.ceil(passesLong / 2) * 2; 
         let passesShort = Math.max(4, Math.floor(passesLong / 5)); 
@@ -190,4 +212,3 @@ runBtn.addEventListener('click', runProfiler);
 
 </body>
 </html>
-  
